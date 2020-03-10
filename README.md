@@ -11,4 +11,4 @@ juju relate apache-httpd dummy-vhost
 juju add-unit apache-httpd
 ```
 
-The content provided by a vhost will be available at the http://<machine-address>:80.
+The content provided by a vhost will be available at the `http://<machine-address>:80`.
