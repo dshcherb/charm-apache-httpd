@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 
+import subprocess
+import collections
+import yaml
+import base64
+import logging
+import sys
+
+sys.path.append('lib') # noqa
+
 from ops.charm import CharmBase, CharmEvents
 from ops.framework import (
     EventSource,
@@ -11,17 +20,14 @@ from ops.model import ActiveStatus
 
 from ops.main import main
 
-import subprocess
-import collections
-import yaml
-import base64
-
 from pathlib import Path
 
 from enum import (
     Enum,
     unique,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ApacheReadyEvent(EventBase):
@@ -84,87 +90,28 @@ class Charm(CharmBase):
         self.framework.observe(self.on.start, self)
         self.framework.observe(self.on.stop, self)
         self.framework.observe(self.on.config_changed, self)
-
         self.framework.observe(self.on.vhost_config_relation_changed, self)
-
         self.framework.observe(self.on.apache_ready, self)
-
-    def _systemd_unit_command(self, command, name):
-        """Run a systemctl command from a subset of commands on a systemd unit."""
-        if command in self.SYSTEMCTL_COMMANDS:
-            log(f'Running systemctl {command} {name}')
-            rc = subprocess.call(['systemctl', command, name])
-            if rc:
-                raise SystemctlCommandException(f'got unexpected return code {rc} while executing {command} on unit {name}')
-        else:
-            raise NotImplementedError(f'usage of systemctl command "{command}" is not supported by the charm.')
-
-    def _is_systemd_unit_active(self, name):
-        """Run systemctl is-active on a unit.
-
-        is-active returns a non-zero exit code to represent an inactive service.
-        """
-        rc = subprocess.call(['systemctl', 'is-active', name])
-        return False if rc else True
 
     def on_install(self, event):
         # Initialize Charm state
         self.state._current_modules = set()
 
-        log(f'on_install: installing {self.HTTPD_SERVICE_NAME}')
-        apt_install(['apache2'])
+        logger.info(f'on_install: installing {self.HTTPD_SERVICE_NAME}')
+        self.apt_install(['apache2'])
         # Disable vhosts that come from the default site.
         self._disable_site('000-default.conf')
 
     def on_start(self, event):
-        log(f'on_start: starting {self.HTTPD_SERVICE_NAME}')
+        logger.info(f'on_start: starting {self.HTTPD_SERVICE_NAME}')
         self._systemd_unit_command('start', self.HTTPD_SERVICE_NAME)
 
     def on_stop(self, event):
-        log(f'on_stop: stop {self.HTTPD_SERVICE_NAME}')
+        logger.info(f'on_stop: stop {self.HTTPD_SERVICE_NAME}')
         self._systemd_unit_command('stop', self.HTTPD_SERVICE_NAME)
 
-    def _get_module_state(self, module_name):
-        return ModuleState(subprocess.call(['a2query', '-m', module_name]))
-
-    def _disable_module(self, module_name):
-        module_state = self._get_module_state(module_name)
-        if module_state == ModuleState.Found:
-            try:
-                log(f'Disabling apache2 module {module_name}')
-                subprocess.check_call(['a2dismod', module_name])
-            except subprocess.CalledProcessError:
-                raise ApacheModuleDisableException(f'unable to disable apache2 module {module_name}.')
-        elif module_state in (ModuleState.OffByAdmin, ModuleState.OffByMaintainer):
-            log(f'Apache2 module {module_name} is already disabled.')
-        elif module_state == ModuleState.NotFound:
-            raise ApacheModuleDisableException(f'module {module_name} was not found.')
-        else:
-            raise ApacheModuleDisableException(f'unexpected module {module_name} state.')
-
-    def _enable_module(self, module_name):
-        try:
-            log(f'Enabling apache2 module {module_name}')
-            subprocess.check_call(['a2enmod', module_name])
-        except subprocess.CalledProcessError:
-            raise ApacheModuleEnableException(f'unable to enable apache2 module {module_name}.')
-
-    def _enable_site(self, site_name):
-        try:
-            log(f'Enabling site {site_name}')
-            subprocess.check_call(['a2ensite', site_name])
-        except subprocess.CalledProcessError:
-            raise ApacheSiteEnableException(f'unable to enable apache2 site {site_name}.')
-
-    def _disable_site(self, site_name):
-        try:
-            log(f'Disabling site {site_name}')
-            subprocess.check_call(['a2dissite', site_name])
-        except subprocess.CalledProcessError:
-            raise ApacheSiteDisableException(f'unable to disable apache2 site {site_name}.')
-
     def on_config_changed(self, event):
-        log(f'on_config_changed: Updating {self.HTTPD_SERVICE_NAME} configuration.')
+        logger.info(f'on_config_changed: Updating {self.HTTPD_SERVICE_NAME} configuration.')
 
         config_modules = set(self.framework.model.config['modules'].split())
 
@@ -186,6 +133,9 @@ class Charm(CharmBase):
 
         self._assess_readiness()
 
+    def on_apache_ready(self, event):
+        self.framework.model.unit.status = ActiveStatus()
+
     def _assess_readiness(self):
         if self._is_systemd_unit_active(self.HTTPD_SERVICE_NAME):
             self.state.ready = True
@@ -193,27 +143,82 @@ class Charm(CharmBase):
         else:
             self.state.ready = False
 
-    def on_apache_ready(self, event):
-        self.framework.model.unit.status = ActiveStatus()
+    def _systemd_unit_command(self, command, name):
+        """Run a systemctl command from a subset of commands on a systemd unit."""
+        if command in self.SYSTEMCTL_COMMANDS:
+            logger.info(f'Running systemctl {command} {name}')
+            rc = subprocess.call(['systemctl', command, name])
+            if rc:
+                raise SystemctlCommandException(f'got unexpected return code {rc} while executing {command} on unit {name}')
+        else:
+            raise NotImplementedError(f'usage of systemctl command "{command}" is not supported by the charm.')
+
+    def _is_systemd_unit_active(self, name):
+        """Run systemctl is-active on a unit.
+
+        is-active returns a non-zero exit code to represent an inactive service.
+        """
+        rc = subprocess.call(['systemctl', 'is-active', name])
+        return False if rc else True
 
     def on_vhost_config_relation_changed(self, event):
         if not self.state.ready:
             event.defer()
             return
 
-        if event.unit:
-            vhosts_serialized = event.relation.data[event.unit].get('vhosts')
+        # no subordinate unit observed yet, let's wait until it appears.
+        if not event.unit:
+            return
 
-            if not vhosts_serialized:
-                return
+        vhosts_serialized = event.relation.data[event.app].get('vhosts')
+        # No vhosts are provided yet - skip this event.
+        if not vhosts_serialized:
+            return
 
-            vhosts = yaml.safe_load(vhosts_serialized)
+        vhosts = yaml.safe_load(vhosts_serialized)
+        for vhost in vhosts:
+            self._enable_site(self.create_vhost(self.framework.model.config['server_name'], vhost["template"], vhost['port']))
 
-            for vhost in vhosts:
-                self._enable_site(self.create_vhost(self.framework.model.config['server_name'], vhost["template"], vhost['port']))
+        self._systemd_unit_command('reload', self.HTTPD_SERVICE_NAME)
 
-            self._systemd_unit_command('reload', self.HTTPD_SERVICE_NAME)
-        # TODO: handle application relation data with Juju 2.7 and once RelationApplicationEvent is implemented in the framework.
+    def _get_module_state(self, module_name):
+        return ModuleState(subprocess.call(['a2query', '-m', module_name]))
+
+    def _disable_module(self, module_name):
+        module_state = self._get_module_state(module_name)
+        if module_state == ModuleState.Found:
+            try:
+                logger.info(f'Disabling apache2 module {module_name}')
+                subprocess.check_call(['a2dismod', module_name])
+            except subprocess.CalledProcessError:
+                raise ApacheModuleDisableException(f'unable to disable apache2 module {module_name}.')
+        elif module_state in (ModuleState.OffByAdmin, ModuleState.OffByMaintainer):
+            logger.info(f'Apache2 module {module_name} is already disabled.')
+        elif module_state == ModuleState.NotFound:
+            raise ApacheModuleDisableException(f'module {module_name} was not found.')
+        else:
+            raise ApacheModuleDisableException(f'unexpected module {module_name} state.')
+
+    def _enable_module(self, module_name):
+        try:
+            logger.info(f'Enabling apache2 module {module_name}')
+            subprocess.check_call(['a2enmod', module_name])
+        except subprocess.CalledProcessError:
+            raise ApacheModuleEnableException(f'unable to enable apache2 module {module_name}.')
+
+    def _enable_site(self, site_name):
+        try:
+            logger.info(f'Enabling site {site_name}')
+            subprocess.check_call(['a2ensite', site_name])
+        except subprocess.CalledProcessError:
+            raise ApacheSiteEnableException(f'unable to enable apache2 site {site_name}.')
+
+    def _disable_site(self, site_name):
+        try:
+            logger.info(f'Disabling site {site_name}')
+            subprocess.check_call(['a2dissite', site_name])
+        except subprocess.CalledProcessError:
+            raise ApacheSiteDisableException(f'unable to disable apache2 site {site_name}.')
 
     @classmethod
     def create_vhost(cls, server_name, template, port, protocol=None):
@@ -235,52 +240,32 @@ class Charm(CharmBase):
         vhost_name = f'{server_name}_{protocol}'
         vhost_file = cls.APACHE_CONFIG_DIR / 'sites-available' / f'{vhost_name}.conf'
 
-        log(f'Writing vhost config to {vhost_file}')
-
-        with open(vhost_file, 'w') as vhost:
-            vhost.write(template)
+        logger.info(f'Writing vhost config to {vhost_file}')
+        vhost_file.write_text(template)
 
         return vhost_name
 
+    def apt_install(self, packages, options=None):
+        """Install one or more packages.
 
-def log(message, level=None):
-    """Write a message to the juju log"""
-    command = ['juju-log']
-    if level:
-        command += ['-l', level]
-    if not isinstance(message, str):
-        message = repr(message)
+        packages -- package(s) to install.
+        options -- a list of apt options to use.
+        """
+        if options is None:
+            options = ['--option=Dpkg::Options::=--force-confold']
 
-    # https://elixir.bootlin.com/linux/latest/source/include/uapi/linux/binfmts.h
-    # PAGE_SIZE * 32 = 4096 * 32
-    MAX_ARG_STRLEN = 131072
-    command += [message[:MAX_ARG_STRLEN]]
-    # Missing juju-log should not cause failures in unit tests
-    # Send log output to stderr
-    subprocess.call(command)
+        command = ['apt-get', '--assume-yes']
+        command.extend(options)
+        command.append('install')
 
+        if isinstance(packages, collections.abc.Sequence):
+            command.extend(packages)
+        else:
+            raise ValueError(f'Invalid type was used for the "packages" argument: {type(packages)} instead of str')
 
-def apt_install(packages, options=None):
-    """Install one or more packages.
+        logger.info("Installing {} with options: {}".format(packages, options))
 
-    packages -- package(s) to install.
-    options -- a list of apt options to use.
-    """
-    if options is None:
-        options = ['--option=Dpkg::Options::=--force-confold']
-
-    command = ['apt-get', '--assume-yes']
-    command.extend(options)
-    command.append('install')
-
-    if isinstance(packages, collections.abc.Sequence):
-        command.extend(packages)
-    else:
-        raise ValueError(f'Invalid type was used for the "packages" argument: {type(packages)} instead of str')
-
-    log("Installing {} with options: {}".format(packages, options))
-
-    subprocess.check_call(command)
+        subprocess.check_call(command)
 
 
 if __name__ == '__main__':

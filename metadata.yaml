@@ -9,13 +9,10 @@ series:
     - bionic
     - disco
     - eoan
-provides:
-    apache-website:
-        interface: apache-website
-        scope: container
 requires:
     vhost-config:
         interface: apache-vhost-config
+        scope: container
 peers:
     httpd-peer:
         interface: httpd-peer
